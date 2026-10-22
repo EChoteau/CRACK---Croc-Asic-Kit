@@ -48,7 +48,7 @@ run_step() {
   local name=$1 dir=$2; shift 2
   local t0; t0=$(date +%s)
   echo "[FLOW] >>> $name"
-  ( cd "$ROOT/$dir" && "$@" ) 2>&1 | tee "$LOGDIR/$name.log"
+  ( cd "$ROOT/$dir" && "$@" ) 2>&1 | sed -u 's/\x1b\[[0-9;]*m//g' | tee "$LOGDIR/$name.log"
   echo "$name : $(( $(date +%s) - t0 )) s" | tee -a "$LOGDIR/timing.txt"
 }
 
