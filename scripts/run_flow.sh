@@ -88,7 +88,8 @@ step_synth() {
 
   # 2) pas d'erreur dans le log (on exclut la ligne bénigne "0 Error, 0 Warning")
   local errs
-  errs=$(grep -i "error" "$LOGDIR/synth.log" | grep -vi "0 error" || true)
+    errs=$(sed 's/\x1b\[[0-9;]*m//g' "$LOGDIR/synth.log" \
+       | grep -i "error" | grep -viE "(^|[^0-9])0[^[:alnum:]]*error" || true)
   if [[ -z "$errs" ]]; then
     log_check VAL-01b OK "aucune erreur dans le log de synthèse"
   else
