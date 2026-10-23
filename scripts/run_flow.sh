@@ -242,7 +242,7 @@ step_backend_stage() {
       # Sorties finales : présentes et non vides, avec somme de contrôle
       local f
       for f in "${PROJ}.def" "${PROJ}_lvs.v" "${PROJ}.v" "${PROJ}.odb" "${PROJ}.sdc"; do
-        if [[ -s "$OR_DIR/out/$f" ]]; then
+        if [[ -s "$OR_DIR/out/$f" && "$OR_DIR/out/$f" -nt "$LOGDIR/versions.txt" ]]; then
           log_check "$val" OK "sortie out/$f présente"
           ( cd "$ROOT" && sha256sum "openroad/out/$f" ) >> "$LOGDIR/checksums.txt"
         else
