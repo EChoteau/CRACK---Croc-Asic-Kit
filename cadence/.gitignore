@@ -1,0 +1,11 @@
+# Runs (logs, rapports, netlists) : archivés hors git
+/runs/
+# Fichiers laissés par les outils Cadence quand on les lance à la main
+*.log
+*.log[0-9]*
+*.cmd
+*.cmd[0-9]*
+fv/
+.cadence/
+genus.log*
+genus.cmd*
