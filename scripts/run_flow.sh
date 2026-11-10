@@ -9,10 +9,14 @@
 #   ./scripts/run_flow.sh floorplan      # une sous-étape du backend
 #   ./scripts/run_flow.sh placement      #   (idem : cts, routing, finishing)
 #   ./scripts/run_flow.sh backend        # les 5 sous-étapes du backend
-#   ./scripts/run_flow.sh all            # toutes les étapes implémentées
+#   ./scripts/run_flow.sh gds            # DEF -> GDS + seal ring (KLayout)
+#   ./scripts/run_flow.sh drc            # DRC complet (KLayout, avec antenna)
+#   ./scripts/run_flow.sh drc_minimal    # DRC minimal (itération rapide, pas un signoff)
+#   ./scripts/run_flow.sh all            # synth + backend + gds + drc complet
 #
-# Variable optionnelle : RUN_ID=nom ./scripts/run_flow.sh <étape>
-#   Garder le même RUN_ID pour regrouper plusieurs étapes dans un seul dossier.
+# Variables optionnelles :
+#   RUN_ID=nom    : garder le même RUN_ID pour regrouper plusieurs étapes
+#   DRC_JOBS=N    : nombre de tables DRC lancées en parallèle (défaut : nproc)
 #
 # Chaque run produit un dossier logs/<RUN_ID>/ contenant :
 #   versions.txt  : versions des outils et commit du dépôt (traçabilité)
@@ -21,11 +25,12 @@
 #   checks.txt    : résultat des vérifications (VAL-01, VAL-05, ...)
 #   checksums.txt : sommes SHA-256 des fichiers produits (reproductibilité)
 #   openroad/     : copie de reports/, save/, out/, logs/ du backend
+#   klayout/      : logs KLayout (def2stream, seal) et rapports DRC
 #
 # Statuts de checks.txt : OK | ECART (à justifier) | ECHEC | MANUEL (à lire à la main)
 #
-# Etapes implémentées : synth, backend (floorplan, placement, cts, routing, finishing)
-# A ajouter (une fois validées à la main) : klayout (GDS), drc
+# Etapes implémentées : synth, backend, gds, drc
+# A ajouter : STA multi-coins (VAL-10, après extraction SPEF), LVS (VAL-14)
 # =============================================================================
 set -euo pipefail   # arrêt à la 1re erreur, variable non définie = erreur,
                     # et code retour d'un pipe = celui de la commande qui échoue
@@ -44,6 +49,12 @@ SYNTH_NETLIST="yosys/out/croc_yosys.v"
 # Backend OpenROAD
 PROJ="${PROJ_NAME:-croc}"      # nom de projet utilisé par les scripts Tcl
 OR_DIR="$ROOT/openroad"
+
+# Finition KLayout
+KL_DIR="$ROOT/klayout"
+TOP="${TOP_DESIGN:-croc_chip}" # module top (défaut de env.sh)
+SEALED_GDS="$KL_DIR/out/${PROJ}.sealed.gds.gz"
+DRC_JOBS="${DRC_JOBS:-$(nproc)}"
 
 mkdir -p "$LOGDIR"
 
@@ -261,9 +272,124 @@ step_backend() {
   done
 }
 
+# =============================================================================
+# ETAPE 3 : GDS (KLayout)
+#   run_finishing.sh --gds --seal :
+#     --gds  : DEF (openroad/out/croc.def) + LEF/GDS du PDK -> klayout/out/croc.gds.gz
+#     --seal : génère le seal ring (die + 2 x 42 µm) et le fusionne
+#              -> klayout/out/croc.sealed.gds.gz, top cell <TOP>_sealed
+#   Le fill (--fill) n'est PAS fait ici : très long, à ajouter pour le signoff
+#   densité (VAL-16). Attention : le DRC de run_drc.sh lit le GDS scellé,
+#   donc SANS fill.
+# =============================================================================
+
+# Copie les logs KLayout et les rapports DRC (pas les GDS, trop lourds)
+collect_klayout() {
+  mkdir -p "$LOGDIR/klayout"
+  [[ -d "$KL_DIR/out" ]] && cp -u "$KL_DIR"/out/*.log "$LOGDIR/klayout/" 2>/dev/null || true
+  local d
+  for d in drc-full drc-minimal; do
+    [[ -d "$KL_DIR/$d" ]] && cp -ru "$KL_DIR/$d" "$LOGDIR/klayout/" || true
+  done
+}
+
+step_gds() {
+  trap 'collect_backend; collect_klayout' EXIT
+  run_step gds klayout ./run_finishing.sh --gds --seal
+
+  # GDS scellé produit pendant CE run
+  if [[ "$SEALED_GDS" -nt "$LOGDIR/versions.txt" && -s "$SEALED_GDS" ]]; then
+    log_check GDS OK "GDS scellé produit ($(du -h "$SEALED_GDS" | cut -f1))"
+    ( cd "$ROOT" && sha256sum "klayout/out/${PROJ}.gds.gz" "klayout/out/${PROJ}.sealed.gds.gz" ) \
+      >> "$LOGDIR/checksums.txt"
+  else
+    log_check GDS ECHEC "GDS scellé absent ou ancien : $SEALED_GDS"
+    exit 1
+  fi
+
+  # Erreurs dans les logs KLayout (redirigés dans klayout/out/ par run_finishing.sh)
+  local f nerr
+  for f in def2stream.log gen_seal.log merge_seal.log; do
+    [[ -f "$KL_DIR/out/$f" ]] || { log_check GDS ECART "log $f absent"; continue; }
+    nerr=$(grep -ciE "error|exception|traceback" "$KL_DIR/out/$f" || true)
+    if [[ "$nerr" -eq 0 ]]; then
+      log_check GDS OK "$f : aucune erreur"
+    else
+      log_check GDS ECHEC "$f : $nerr ligne(s) d'erreur"
+      exit 1
+    fi
+  done
+
+  # VAL-17 (partiel) : cellules manquantes lors de la conversion DEF -> GDS
+  # (def2stream signale les cellules sans GDS ; formulation à confirmer au 1er run)
+  local nmiss
+  nmiss=$(grep -ciE "missing|not found|no gds" "$KL_DIR/out/def2stream.log" || true)
+  if [[ "$nmiss" -eq 0 ]]; then
+    log_check VAL-17 OK "def2stream : aucune cellule signalée manquante"
+  else
+    log_check VAL-17 ECART "def2stream : $nmiss ligne(s) 'missing/not found' (voir klayout/def2stream.log)"
+  fi
+}
+
+# =============================================================================
+# ETAPE 4 : DRC (KLayout, deck IHP sg13cmos5l)
+#   run_drc.sh --full    : toutes les règles + antenna (signoff, VAL-13/VAL-15)
+#   run_drc.sh --minimal : interconnexions seulement (itération, PAS un signoff)
+#   Entrée : klayout/out/croc.sealed.gds.gz ; sortie : klayout/drc-<mode>/
+#   Les violations sont écrites dans des bases de résultats KLayout (*.lyrdb),
+#   une par table de règles ; chaque violation est un élément <item>.
+# =============================================================================
+step_drc() {
+  local mode=${1:-full}
+  local rundir="$KL_DIR/drc-$mode"
+  trap 'collect_backend; collect_klayout' EXIT
+
+  # Le GDS doit exister (étape gds faite avant, dans ce run ou un précédent)
+  if [[ ! -s "$SEALED_GDS" ]]; then
+    log_check VAL-13 ECHEC "GDS scellé absent : lancer d'abord l'étape gds"
+    exit 1
+  fi
+
+  # Vider les résultats précédents pour ne pas compter d'anciennes violations
+  rm -rf "$rundir"
+
+  run_step "drc_$mode" klayout ./run_drc.sh "--$mode" --jobs "$DRC_JOBS"
+
+  # Bases de résultats produites
+  local dbs
+  mapfile -t dbs < <(find "$rundir" -name "*.lyrdb" -type f 2>/dev/null | sort)
+  if [[ ${#dbs[@]} -eq 0 ]]; then
+    log_check VAL-13 ECHEC "DRC $mode : aucun fichier .lyrdb dans $rundir"
+    exit 1
+  fi
+
+  # Comptage des violations par table, puis total
+  local db n total=0 detail=""
+  for db in "${dbs[@]}"; do
+    n=$(grep -c "<item>" "$db" || true)
+    total=$(( total + n ))
+    [[ "$n" -gt 0 ]] && detail+=" $(basename "$db" .lyrdb)=$n"
+  done
+
+  local label="VAL-13"
+  [[ "$mode" == "minimal" ]] && label="VAL-13(min)"
+  if [[ "$total" -eq 0 ]]; then
+    log_check "$label" OK "DRC $mode : 0 violation (${#dbs[@]} table(s))"
+  else
+    # Pas d'arrêt : chaque violation doit être corrigée ou justifiée (journal des écarts)
+    log_check "$label" ECART "DRC $mode : $total violation(s) :$detail"
+  fi
+
+  # VAL-15 / VAL-16 : en mode full, antenna et densité font partie du deck
+  if [[ "$mode" == "full" ]]; then
+    log_check VAL-15 MANUEL "antenna incluse dans le DRC full : lire la table antenna dans klayout/drc-full"
+    log_check VAL-16 MANUEL "densité vérifiée sur le GDS SANS fill : violations de densité attendues tant que --fill n'est pas fait"
+  fi
+}
+
 # --- (à venir) ---------------------------------------------------------------
-# step_finish()  { run_step finish  klayout  ./run_finishing.sh --gds --seal ; ... }
-# step_drc()     { run_step drc     klayout  ./run_drc.sh --minimal ; ... }
+# step_sta() : STA multi-coins avec SPEF (VAL-10), après activation de l'extraction RC
+# step_lvs() : LVS (VAL-14)
 
 # =============================================================================
 # Point d'entrée
@@ -271,13 +397,18 @@ step_backend() {
 STEP="${1:-all}"
 record_versions
 echo "[FLOW] run $RUN_ID -> $LOGDIR"
+# Séparateur daté : distingue plusieurs lancements dans un même dossier de run
+echo "===== $(date '+%Y-%m-%d %H:%M') : étape '$STEP' =====" | tee -a "$LOGDIR/checks.txt" >> "$LOGDIR/timing.txt"
 
 case "$STEP" in
-  synth)   step_synth ;;
+  synth)       step_synth ;;
   floorplan|placement|cts|routing|finishing) step_backend_stage "$STEP" ;;
-  backend) step_backend ;;
-  all)     step_synth; step_backend ;;   # compléter au fur et à mesure
-  *)       echo "Usage : $0 {synth|floorplan|placement|cts|routing|finishing|backend|all}"; exit 2 ;;
+  backend)     step_backend ;;
+  gds)         step_gds ;;
+  drc)         step_drc full ;;
+  drc_minimal) step_drc minimal ;;
+  all)         step_synth; step_backend; step_gds; step_drc full ;;
+  *)           echo "Usage : $0 {synth|floorplan|placement|cts|routing|finishing|backend|gds|drc|drc_minimal|all}"; exit 2 ;;
 esac
 
 echo "[FLOW] terminé : $LOGDIR"
