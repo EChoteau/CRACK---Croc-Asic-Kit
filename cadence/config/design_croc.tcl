@@ -5,7 +5,7 @@
 #
 # Tout ce qui est ici est repris du flot open-source de Croc (yosys/, openroad/)
 # pour que le benchmark compare les outils et pas des designs différents.
-# Voir doc/contraintes_flot_open.md pour la correspondance ligne à ligne.
+# Voir doc/recap_flows.md pour la correspondance ligne à ligne.
 # =============================================================================
 
 # Racine du clone Croc (exportée par run_implem.sh)

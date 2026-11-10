@@ -31,8 +31,9 @@ crack_report "$RUN(rpt)/04_timing_summary.rpt" "report_timing_summary"
 crack_report "$RUN(rpt)/04_power.rpt"          "report_power"
 crack_report "$RUN(rpt)/04_clocks.rpt"         "report_clocks"
 
-# Timing par vue (setup + hold)
-foreach _c $TECH(corners) {
+# Timing par vue de setup. Genus n'analyse que le setup : les vues de hold
+# (view_ff) ne sont pas actives ici, le hold sera vérifié dans Innovus/STA.
+foreach _c $TECH(setup_corners) {
     crack_report "$RUN(rpt)/04_timing_view_${_c}.rpt" \
         "report_timing -view view_${_c} -max_paths 10"
 }
@@ -59,7 +60,11 @@ crack_write_file "$RUN(rpt)/04_macros.rpt" $_s
 
 # --- Sorties -------------------------------------------------------------------
 write_hdl > "$RUN(out)/${_p}_genus.v"
-write_sdc > "$RUN(out)/${_p}_genus.sdc"
+# En MMMC, write_sdc demande une vue (SDC-20) : première vue de setup
+set _sdc_view "view_[lindex $TECH(setup_corners) 0]"
+if {[catch {write_sdc -view $_sdc_view > "$RUN(out)/${_p}_genus.sdc"} err]} {
+    crack_warn "write_sdc -view $_sdc_view : $err"
+}
 
 if {[catch {write_design -innovus -base_name "$RUN(out)/innovus/${_p}"} err]} {
     crack_warn "write_design -innovus : $err"

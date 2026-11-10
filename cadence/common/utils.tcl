@@ -136,12 +136,50 @@ proc crack_write_file {path content} {
 }
 
 # -----------------------------------------------------------------------------
+# Liste des modules déclarés dans les sources RTL (regex "module <nom>"),
+# triée du plus long au plus court. Sert à retrouver le nom RTL d'origine
+# d'un module paramétré renommé par l'outil (gpio -> gpio_ObiCfg...).
+# -----------------------------------------------------------------------------
+proc crack_rtl_modules {files} {
+    set mods [list]
+    foreach f $files {
+        if {[catch {open $f r} fh]} { continue }
+        set txt [read $fh]
+        close $fh
+        foreach {_ m} [regexp -all -inline -line {^\s*module\s+(?:automatic\s+|static\s+)?([A-Za-z_][A-Za-z0-9_]*)} $txt] {
+            lappend mods $m
+        }
+    }
+    set mods [lsort -unique $mods]
+    return [lsort -command {apply {{a b} {expr {[string length $b] - [string length $a]}}}} $mods]
+}
+
+# Nom RTL d'origine d'un module : le plus long module RTL égal au nom ou
+# préfixe suivi de "_" (paramètres / uniquification ajoutés par l'outil).
+proc crack_module_base {name rtl_modules} {
+    foreach m $rtl_modules {
+        if {$name eq $m || [string match "${m}_*" $name]} { return $m }
+    }
+    return $name
+}
+
+# -----------------------------------------------------------------------------
 # Test "le nom de module correspond-il à un motif de la liste ?"
 # Les noms de modules paramétrés sont suffixés par l'outil
 # (ex. cdc_2phase -> cdc_2phase_T_logic...), on accepte donc "motif" et
 # "motif_*", comme les motifs "t:<module>$*" du flot Yosys.
 # -----------------------------------------------------------------------------
-proc crack_name_matches {name patterns} {
+#   Si rtl_modules est fourni, on compare le NOM RTL d'origine (match exact
+#   ou glob, comme "t:<module>$*" de Yosys) : gpio garde gpio mais pas
+#   gpio_reg_top. Sinon, repli approximatif sur "motif" / "motif_*".
+proc crack_name_matches {name patterns {rtl_modules {}}} {
+    if {[llength $rtl_modules] > 0} {
+        set base [crack_module_base $name $rtl_modules]
+        foreach p $patterns {
+            if {[string match $p $base]} { return 1 }
+        }
+        return 0
+    }
     foreach p $patterns {
         if {[string match $p $name] || [string match "${p}_*" $name]} {
             return 1

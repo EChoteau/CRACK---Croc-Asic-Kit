@@ -6,4 +6,4 @@ Entrées prévues, produites par l'étape `synth` :
 - `runs/<run>/genus/out/innovus/` (base écrite par `write_design -innovus`)
 
 Les paramètres P&R du flot open à reproduire sont listés dans
-`../doc/contraintes_flot_open.md` §5.
+`../doc/recap_flows.md` (§5 à §10).

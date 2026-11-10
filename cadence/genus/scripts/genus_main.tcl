@@ -43,7 +43,8 @@ source "$CRACK_ROOT/constraints/croc_cdc.tcl"
 
 crack_banner "Genus : $DESIGN(top) / $TECH(name) / clk_sys $CONSTR(tck_sys) ns"
 crack_info "Run     : $RUN(dir)"
-crack_info "Efforts : generic=$FLOW(syn_generic_effort) map=$FLOW(syn_map_effort) opt=$FLOW(syn_opt_effort)"
+crack_info "Profil  : $FLOW(profile)"
+crack_info "Efforts : generic=$FLOW(syn_generic_effort) map=$FLOW(syn_map_effort) opt=$FLOW(syn_opt_effort) incr=$FLOW(syn_opt_incr)"
 crack_info "Hiérarchie : $FLOW(hier_mode)   interconnect : $FLOW(interconnect)"
 
 # --- Exécution des étapes -----------------------------------------------------

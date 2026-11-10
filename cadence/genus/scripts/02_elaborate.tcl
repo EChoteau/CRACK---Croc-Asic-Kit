@@ -15,6 +15,10 @@ set _defines [crack_merge_defines [dict get $_fl defines] \
                   [concat $TECH(extra_defines) $DESIGN(extra_defines)]]
 
 crack_info "flist   : $DESIGN(flist) ([llength $_files] fichiers)"
+
+# Noms des modules RTL (pour reconnaître les modules paramétrés, étape 03)
+set DESIGN(rtl_modules) [crack_rtl_modules $_files]
+crack_info "modules RTL : [llength $DESIGN(rtl_modules)]"
 crack_info "defines : $_defines"
 
 # Trace exacte de ce qui a été lu (reproductibilité / comparaison avec Yosys)

@@ -39,6 +39,7 @@ STOP_AFTER=""
 HIER=""
 EFFORT=""
 INTERCO=""
+PROFILE="iso"
 
 show_help() {
     cat << EOF
@@ -53,6 +54,7 @@ Options :
   -c, --clk <ns>          période de clk_sys en ns             [$CLK_NS]
       --tag <texte>       suffixe ajouté au nom du run
       --env <fichier>     environnement outils à sourcer        [env_cime.sh]
+  -p, --profile <p>       iso (outils par défaut) | max (efforts max)  [iso]
       --hier <mode>       yosys_like | keep_all | auto         [yosys_like]
       --effort <niv>      effort Genus generic/map/opt          [medium]
       --interconnect <m>  ple | none                            [ple]
@@ -106,6 +108,7 @@ while [[ $# -gt 0 ]]; do
         -c|--clk)          CLK_NS="$2"; shift 2 ;;
         --tag)             TAG="$2"; shift 2 ;;
         --env)             ENV_FILE="$2"; shift 2 ;;
+        -p|--profile)      PROFILE="$2"; shift 2 ;;
         --hier)            HIER="$2"; shift 2 ;;
         --effort)          EFFORT="$2"; shift 2 ;;
         --interconnect)    INTERCO="$2"; shift 2 ;;
@@ -121,6 +124,7 @@ done
 [[ -f "$CRACK_ROOT/config/tech/$TECH.tcl" ]] || die "Techno inconnue : $TECH (voir --list-techs)"
 [[ "$CLK_NS" =~ ^[0-9]+([.][0-9]+)?$ ]]     || die "Période invalide : $CLK_NS"
 [[ "$STEPS" == "all" ]] && STEPS="synth,pnr,signoff"
+[[ "$PROFILE" == "iso" || "$PROFILE" == "max" ]] || die "Profil inconnu : $PROFILE (iso | max)"
 [[ -z "$ENV_FILE" ]] && ENV_FILE="$CRACK_ROOT/env_cime.sh"
 [[ -f "$ENV_FILE" ]] || die "Fichier d'environnement introuvable : $ENV_FILE"
 
@@ -129,11 +133,11 @@ done
 # ----------------------------------------------------------------------------
 FREQ_MHZ=$(awk -v p="$CLK_NS" 'BEGIN { printf "%g", 1000.0 / p }')
 STAMP=$(date +%Y%m%d-%H%M%S)
-RUN_NAME="licence_${TECH}_${FREQ_MHZ}MHz_${STAMP}${TAG:+_$TAG}"
+RUN_NAME="licence-${PROFILE}_${TECH}_${FREQ_MHZ}MHz_${STAMP}${TAG:+_$TAG}"
 RUN_DIR="$CRACK_ROOT/runs/$RUN_NAME"
 
 log "Run    : $RUN_NAME"
-log "Techno : $TECH   clk_sys : $CLK_NS ns ($FREQ_MHZ MHz)   étapes : $STEPS"
+log "Techno : $TECH   clk_sys : $CLK_NS ns ($FREQ_MHZ MHz)   profil : $PROFILE   étapes : $STEPS"
 
 if [[ "$DRYRUN" -eq 0 ]]; then
     mkdir -p "$RUN_DIR"/{constraints,genus/logs,genus/reports,genus/out}
@@ -171,6 +175,7 @@ export CROC_ROOT CRACK_ROOT
 export CRACK_RUN_DIR="$RUN_DIR"
 export CRACK_TECH="$TECH"
 export CRACK_CLK_SYS_NS="$CLK_NS"
+export CRACK_PROFILE="$PROFILE"
 if [[ -n "$HIER" ]];       then export CRACK_HIER_MODE="$HIER"; fi
 if [[ -n "$EFFORT" ]];     then export CRACK_SYN_EFFORT="$EFFORT" CRACK_MAP_EFFORT="$EFFORT" CRACK_OPT_EFFORT="$EFFORT"; fi
 if [[ -n "$INTERCO" ]];    then export CRACK_INTERCONNECT="$INTERCO"; fi
@@ -192,6 +197,7 @@ write_run_info() {
         echo "git_dirty    $git_dirty fichier(s) modifié(s)"
         echo "tech         $TECH"
         echo "clk_sys_ns   $CLK_NS"
+        echo "profile      $PROFILE"
         echo "steps        $STEPS"
         echo "command      $0 $ORIG_ARGS"
         echo "env_file     $ENV_FILE"
@@ -254,6 +260,25 @@ step_synth() {
     local nwarn
     nwarn=$(grep -c "\[CRACK\]\[WARNING\]" "$gdir/logs/genus.stdout" 2>/dev/null) || nwarn=0
     log "Genus terminé : $nwarn warning(s) CRACK, rapports dans $gdir/reports"
+
+    # Métriques communes (VAL-22) : runs/<run>/metrics/synth_genus.{txt,json,csv}
+    [[ -z "$STOP_AFTER" ]] && extract_metrics genus "$RUN_DIR"
+}
+
+# Extraction des métriques (non bloquante : un échec ne casse pas le run)
+extract_metrics() {
+    local py
+    py=$(command -v python3 || command -v python || true)
+    if [[ -z "$py" ]]; then
+        warn "python introuvable : métriques non extraites"
+        return 0
+    fi
+    if "$py" "$CRACK_ROOT/scripts/extract_metrics.py" "$@"; then
+        log "Métriques : $RUN_DIR/metrics/synth_genus.txt"
+    else
+        warn "extraction des métriques échouée (voir $RUN_LOG)"
+    fi
+    return 0
 }
 
 step_pnr()     { die "Etape pnr (Innovus) pas encore implémentée"; }

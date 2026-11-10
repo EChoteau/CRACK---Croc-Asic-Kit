@@ -10,7 +10,7 @@
 #   - le SDC écrit est archivé dans le run -> protocole traçable (VAL-19).
 # Le contenu reste une copie ligne à ligne de constraints.sdc (hors CDC, qui
 # sont dans croc_cdc.tcl). Toute différence doit apparaître dans
-# doc/contraintes_flot_open.md.
+# doc/recap_flows.md.
 # =============================================================================
 
 proc crack_write_croc_sdc {path} {

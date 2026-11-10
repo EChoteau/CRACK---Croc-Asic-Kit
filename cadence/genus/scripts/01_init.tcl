@@ -45,6 +45,11 @@ crack_set_db hdl_unconnected_value  0      ;# = "setundef -zero" de Yosys
 crack_set_db lp_insert_clock_gating [expr {$FLOW(clock_gating) ? "true" : "false"}]
 # Constantes -> cellules tie (Yosys : hilomap)
 crack_set_db use_tiehilo_for_const unique
+# Bascules à preset asynchrone : la lib sg13g2 n'a que des bascules à reset
+# (dfrbp) ; sans cette option Genus refuse de mapper (MAP-2). Genus réalise
+# alors le preset avec une bascule à reset + inverseurs en entrée/sortie,
+# exactement ce que fait dfflibmap côté Yosys (legalisation des bascules).
+crack_set_db lbr_seq_in_out_phase_opto true
 # Pas d'"assign" dans la netlist (Yosys : splitnets/clean, Innovus les aime peu)
 crack_set_db remove_assigns true
 # Hiérarchie : Genus ne doit pas dégrouper de lui-même, sauf mode "auto"
