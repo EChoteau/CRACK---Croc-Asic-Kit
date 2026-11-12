@@ -12,7 +12,8 @@
 #   ./scripts/run_flow.sh gds            # DEF -> GDS + seal ring (KLayout)
 #   ./scripts/run_flow.sh drc            # DRC complet (KLayout, avec antenna)
 #   ./scripts/run_flow.sh drc_minimal    # DRC minimal (itération rapide, pas un signoff)
-#   ./scripts/run_flow.sh all            # synth + backend + gds + drc complet
+#   ./scripts/run_flow.sh lvs            # LVS (Verilog -> SPICE, puis KLayout) sur le GDS non scellé
+#   ./scripts/run_flow.sh all            # synth + backend + gds + drc complet + lvs
 #
 # Variables optionnelles :
 #   RUN_ID=nom    : garder le même RUN_ID pour regrouper plusieurs étapes
@@ -29,8 +30,8 @@
 #
 # Statuts de checks.txt : OK | ECART (à justifier) | ECHEC | MANUEL (à lire à la main)
 #
-# Etapes implémentées : synth, backend, gds, drc
-# A ajouter : STA multi-coins (VAL-10, après extraction SPEF), LVS (VAL-14)
+# Etapes implémentées : synth, backend, gds, drc, lvs
+# A ajouter : STA multi-coins (VAL-10, après extraction SPEF)
 # =============================================================================
 set -euo pipefail   # arrêt à la 1re erreur, variable non définie = erreur,
                     # et code retour d'un pipe = celui de la commande qui échoue
@@ -291,6 +292,11 @@ collect_klayout() {
   for d in drc-full drc-minimal; do
     [[ -d "$KL_DIR/$d" ]] && cp -ru "$KL_DIR/$d" "$LOGDIR/klayout/" || true
   done
+  # LVS : on garde les logs et le schéma SPICE, pas la base .lvsdb (lourde)
+  if [[ -d "$KL_DIR/lvs" ]]; then
+    mkdir -p "$LOGDIR/klayout/lvs"
+    cp -u "$KL_DIR"/lvs/*.log "$KL_DIR"/lvs/*.cir "$LOGDIR/klayout/lvs/" 2>/dev/null || true
+  fi
 }
 
 step_gds() {
@@ -323,7 +329,7 @@ step_gds() {
   # VAL-17 (partiel) : cellules manquantes lors de la conversion DEF -> GDS
   # (def2stream signale les cellules sans GDS ; formulation à confirmer au 1er run)
   local nmiss
-  nmiss=$(grep -ciE "missing|not found|no gds" "$KL_DIR/out/def2stream.log" || true)
+  nmiss=$(grep -iE "missing|not found|no gds" "$KL_DIR/out/def2stream.log" | grep -vic "checking for missing" || true)
   if [[ "$nmiss" -eq 0 ]]; then
     log_check VAL-17 OK "def2stream : aucune cellule signalée manquante"
   else
@@ -371,6 +377,10 @@ step_drc() {
     [[ "$n" -gt 0 ]] && detail+=" $(basename "$db" .lyrdb)=$n"
   done
 
+    # Résumé des violations par règle (une ligne par catégorie, triée)
+  grep -ho "<category>'[^<]*" "${dbs[@]}" | sed "s/<category>//; s/'//g" \
+    | sort | uniq -c | sort -rn > "$LOGDIR/drc_${mode}_summary.txt" || true
+
   local label="VAL-13"
   [[ "$mode" == "minimal" ]] && label="VAL-13(min)"
   if [[ "$total" -eq 0 ]]; then
@@ -387,9 +397,89 @@ step_drc() {
   fi
 }
 
+# =============================================================================
+# ETAPE 5 : LVS (KLayout, deck IHP du PDK choisi par CROC_PDK) -- VAL-14
+#   1) scripts/verilog2spice.py : openroad/out/<proj>_lvs.v -> klayout/lvs/<top>_schematic.cir
+#      run_lvs.py n'accepte que du SPICE/CDL ; l'ordre des broches de chaque cellule
+#      est lu dans les CDL du PDK (cellules standard, IO, SRAM).
+#   2) run_lvs.py (dans le PDK) : extrait la netlist du GDS et la compare au schéma.
+#
+#   Le LVS tourne sur le GDS NON scellé (klayout/out/<proj>.gds.gz, top cell = $TOP) :
+#   le deck cherche dans le schéma un circuit du même nom que le top cell du layout,
+#   et le seal ring ne contient aucun dispositif.
+#   Les SRAM ne sont fournies qu'en CDL du PDK sg13g2 (cellules partagées avec cmos5l).
+# =============================================================================
+step_lvs() {
+  trap 'collect_backend; collect_klayout' EXIT
+  local pdk="${CROC_PDK:-sg13cmos5l}"
+  local lvs_v="$OR_DIR/out/${PROJ}_lvs.v"
+  local gds="$KL_DIR/out/${PROJ}.gds.gz"
+  local rundir="$KL_DIR/lvs"
+  local sch="$rundir/${TOP}_schematic.cir"
+  local g2="$ROOT/ihp13/sg13g2/ihp-sg13g2"
+  local kl_path std_cdl io_cdl
+  case "$pdk" in
+    sg13cmos5l)
+      kl_path="$ROOT/ihp13/sg13cmos5l/libs.tech/klayout"
+      std_cdl="$ROOT/ihp13/sg13cmos5l/libs.ref/sg13cmos5l_stdcell/cdl/sg13cmos5l_stdcell.cdl"
+      io_cdl="$ROOT/ihp13/sg13cmos5l/libs.ref/sg13cmos5l_io/cdl/sg13cmos5l_io.cdl" ;;
+    sg13g2)
+      kl_path="$g2/libs.tech/klayout"
+      std_cdl="$g2/libs.ref/sg13g2_stdcell/cdl/sg13g2_stdcell.cdl"
+      io_cdl="$g2/libs.ref/sg13g2_io/cdl/sg13g2_io.cdl" ;;
+    *) log_check VAL-14 ECHEC "CROC_PDK inconnu : $pdk"; exit 1 ;;
+  esac
+  local runner="$kl_path/tech/lvs/run_lvs.py"
+
+  # Entrées nécessaires (le backend et l'étape gds doivent avoir tourné avant)
+  local f
+  for f in "$lvs_v" "$gds" "$runner" "$std_cdl" "$io_cdl"; do
+    if [[ ! -s "$f" ]]; then
+      log_check VAL-14 ECHEC "entrée absente : ${f#$ROOT/} (étapes backend et gds faites ?)"
+      exit 1
+    fi
+  done
+
+  # Liste des CDL : cellules standard, IO, et toutes les SRAM (seules celles utilisées sont gardées)
+  local cdl_args=(--cdl "$std_cdl" --cdl "$io_cdl")
+  for f in "$g2"/libs.ref/sg13g2_sram/cdl/RM_*.cdl; do cdl_args+=(--cdl "$f"); done
+
+  rm -rf "$rundir"; mkdir -p "$rundir"
+
+  # 1) Verilog -> SPICE
+  run_step lvs_netlist . python3 "$ROOT/scripts/verilog2spice.py" \
+      --verilog "$lvs_v" --top "$TOP" --out "$sch" "${cdl_args[@]}"
+  if [[ ! -s "$sch" ]]; then
+    log_check VAL-14 ECHEC "schéma SPICE non produit (voir lvs_netlist.log)"
+    exit 1
+  fi
+  # Cellules du Verilog sans sous-circuit CDL : bondpads et remplissage IO attendus, le reste est suspect
+  local unk
+  unk=$(grep -o "cellule inconnue (ignorée) : .*" "$LOGDIR/lvs_netlist.log" | sed 's/.*: //' | tr '\n' ' ' || true)
+  if [[ -z "$unk" ]]; then
+    log_check VAL-14a OK "toutes les cellules du Verilog ont un sous-circuit CDL"
+  else
+    log_check VAL-14a ECART "cellules sans CDL (ignorées dans le schéma) : $unk"
+  fi
+  ( cd "$ROOT" && sha256sum "${lvs_v#$ROOT/}" ) >> "$LOGDIR/checksums.txt"
+
+  # 2) Extraction du layout + comparaison. Un code retour non nul est possible en cas
+  #    de mismatch : le verdict est lu dans les logs, pas dans le code retour.
+  run_step lvs klayout python3 "$runner" \
+      --layout "$gds" --netlist "$sch" --topcell "$TOP" --run_dir "$rundir" || true
+
+  if grep -rqs "Congratulations! Netlists match" "$LOGDIR/lvs.log" "$rundir"; then
+    log_check VAL-14 OK "LVS : les netlists correspondent (top cell $TOP, PDK $pdk)"
+  elif grep -rqs "Netlists don't match" "$LOGDIR/lvs.log" "$rundir"; then
+    log_check VAL-14 ECART "LVS : mismatch, ouvrir le .lvsdb de klayout/lvs dans KLayout et justifier chaque écart"
+  else
+    log_check VAL-14 ECHEC "LVS : aucun verdict dans les logs (voir lvs.log)"
+  fi
+  log_check VAL-14 MANUEL "vérifier dans lvs.log : top-level pins/alimentations, dispositifs extraits vs schéma, cellules ignorées (VAL-14a)"
+}
+
 # --- (à venir) ---------------------------------------------------------------
 # step_sta() : STA multi-coins avec SPEF (VAL-10), après activation de l'extraction RC
-# step_lvs() : LVS (VAL-14)
 
 # =============================================================================
 # Point d'entrée
@@ -407,8 +497,9 @@ case "$STEP" in
   gds)         step_gds ;;
   drc)         step_drc full ;;
   drc_minimal) step_drc minimal ;;
-  all)         step_synth; step_backend; step_gds; step_drc full ;;
-  *)           echo "Usage : $0 {synth|floorplan|placement|cts|routing|finishing|backend|gds|drc|drc_minimal|all}"; exit 2 ;;
+  lvs)         step_lvs ;;
+  all)         step_synth; step_backend; step_gds; step_drc full; step_lvs ;;
+  *)           echo "Usage : $0 {synth|floorplan|placement|cts|routing|finishing|backend|gds|drc|drc_minimal|lvs|all}"; exit 2 ;;
 esac
 
 echo "[FLOW] terminé : $LOGDIR"
