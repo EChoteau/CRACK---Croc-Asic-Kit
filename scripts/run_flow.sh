@@ -12,6 +12,7 @@
 #   ./scripts/run_flow.sh gds            # DEF -> GDS + seal ring (KLayout)
 #   ./scripts/run_flow.sh drc            # DRC complet (KLayout, avec antenna)
 #   ./scripts/run_flow.sh drc_minimal    # DRC minimal (itération rapide, pas un signoff)
+#   ./scripts/run_flow.sh drc_report     # ré-analyse les résultats DRC existants (full|minimal)
 #   ./scripts/run_flow.sh lvs            # LVS (Verilog -> SPICE, puis KLayout) sur le GDS non scellé
 #   ./scripts/run_flow.sh all            # synth + backend + gds + drc complet + lvs
 #
@@ -68,13 +69,17 @@ log_check() {
 
 # run_step <nom> <dossier> <commande...> : exécute une commande dans un dossier,
 # enregistre son log (sans codes couleur ANSI) et sa durée.
-# Une erreur arrête tout le flot (pipefail).
+# La durée est écrite même si la commande échoue ; le code retour de la
+# commande est ensuite renvoyé, donc une erreur arrête le flot (set -e),
+# sauf si l'appelant l'intercepte avec "|| rc=$?" (cas du DRC).
 run_step() {
   local name=$1 dir=$2; shift 2
-  local t0; t0=$(date +%s)
+  local t0 rc=0; t0=$(date +%s)
   echo "[FLOW] >>> $name"
-  ( cd "$ROOT/$dir" && "$@" ) 2>&1 | sed -u 's/\x1b\[[0-9;]*m//g' | tee "$LOGDIR/$name.log"
+  ( cd "$ROOT/$dir" && "$@" ) 2>&1 | sed -u 's/\x1b\[[0-9;]*m//g' | tee "$LOGDIR/$name.log" || rc=$?
   echo "$name : $(( $(date +%s) - t0 )) s" | tee -a "$LOGDIR/timing.txt"
+  [[ "$rc" -eq 0 ]] || echo "[FLOW] $name : code retour $rc"
+  return "$rc"
 }
 
 # --- Traçabilité : versions des outils et du dépôt ---------------------------
@@ -344,56 +349,113 @@ step_gds() {
 #   Entrée : klayout/out/croc.sealed.gds.gz ; sortie : klayout/drc-<mode>/
 #   Les violations sont écrites dans des bases de résultats KLayout (*.lyrdb),
 #   une par table de règles ; chaque violation est un élément <item>.
+#
+#   ATTENTION : run_drc.py renvoie un code d'erreur dès qu'il y a des
+#   violations ("KLayout DRC Check Failed"). Ce n'est pas un plantage :
+#   seuls l'absence de résultats ou une exception d'un worker sont des échecs.
+#
+#   Durée mesurée (ocaepc69, 20 coeurs) : ~43 min, fixée par la table
+#   sg13cmos5l_maximal (les autres tables finissent en ~18 min).
 # =============================================================================
+
+# Lance le DRC puis l'analyse (drc_report)
 step_drc() {
   local mode=${1:-full}
   local rundir="$KL_DIR/drc-$mode"
+  local label="VAL-13"; [[ "$mode" == "minimal" ]] && label="VAL-13(min)"
   trap 'collect_backend; collect_klayout' EXIT
 
   # Le GDS doit exister (étape gds faite avant, dans ce run ou un précédent)
   if [[ ! -s "$SEALED_GDS" ]]; then
-    log_check VAL-13 ECHEC "GDS scellé absent : lancer d'abord l'étape gds"
+    log_check "$label" ECHEC "GDS scellé absent : lancer d'abord l'étape gds"
     exit 1
   fi
 
   # Vider les résultats précédents pour ne pas compter d'anciennes violations
   rm -rf "$rundir"
 
-  run_step "drc_$mode" klayout ./run_drc.sh "--$mode" --jobs "$DRC_JOBS"
+  # Code retour intercepté : non nul dès qu'il y a des violations (voir plus haut)
+  local rc=0
+  run_step "drc_$mode" klayout ./run_drc.sh "--$mode" --jobs "$DRC_JOBS" || rc=$?
 
-  # Bases de résultats produites
+  # Vrai échec : un worker a planté
+  if grep -Fq " generated an exception:" "$rundir/drc-coordinator.log" 2>/dev/null; then
+    log_check "$label" ECHEC "DRC $mode : exception d'un worker (voir drc-coordinator.log)"
+    exit 1
+  fi
+  [[ "$rc" -ne 0 ]] && echo "[FLOW] DRC : code retour $rc = violations détectées (attendu), analyse..."
+
+  drc_report "$mode"
+}
+
+# Analyse des résultats DRC déjà présents dans klayout/drc-<mode>/ (sans relancer)
+#   - vérifie que chaque table lancée a produit son .lyrdb (run complet)
+#   - écrit drc_<mode>_summary.txt : violations par table et par règle
+#   - sépare règles obligatoires et recommandées (suffixe R, ex. Pad.fR_M2, Pad.d1R)
+drc_report() {
+  local mode=${1:-full}
+  local rundir="$KL_DIR/drc-$mode"
+  local label="VAL-13"; [[ "$mode" == "minimal" ]] && label="VAL-13(min)"
+  trap 'collect_backend; collect_klayout' EXIT
+
   local dbs
   mapfile -t dbs < <(find "$rundir" -name "*.lyrdb" -type f 2>/dev/null | sort)
   if [[ ${#dbs[@]} -eq 0 ]]; then
-    log_check VAL-13 ECHEC "DRC $mode : aucun fichier .lyrdb dans $rundir"
+    log_check "$label" ECHEC "DRC $mode : aucun fichier .lyrdb dans $rundir"
     exit 1
   fi
 
-  # Comptage des violations par table, puis total
-  local db n total=0 detail=""
-  for db in "${dbs[@]}"; do
-    n=$(grep -c "<item>" "$db" || true)
-    total=$(( total + n ))
-    [[ "$n" -gt 0 ]] && detail+=" $(basename "$db" .lyrdb)=$n"
+  # Run complet ? Une table avec un .log mais sans .lyrdb n'a pas terminé
+  local lg incomplete=""
+  for lg in "$rundir"/*_sealed_*.log; do
+    [[ -f "$lg" ]] || continue
+    [[ -f "${lg%.log}.lyrdb" ]] || incomplete+=" $(basename "$lg" .log | sed 's/.*_sealed_//')"
   done
+  if [[ -n "$incomplete" ]]; then
+    log_check "$label" ECART "DRC $mode : table(s) sans résultat (run interrompu ?) :$incomplete"
+  else
+    log_check "$label" OK "DRC $mode : ${#dbs[@]} table(s), toutes terminées"
+  fi
 
-    # Résumé des violations par règle (une ligne par catégorie, triée)
-  grep -ho "<category>'[^<]*" "${dbs[@]}" | sed "s/<category>//; s/'//g" \
-    | sort | uniq -c | sort -rn > "$LOGDIR/drc_${mode}_summary.txt" || true
+  # Résumé : par table, puis par règle
+  local summary="$LOGDIR/drc_${mode}_summary.txt"
+  local rules
+  rules=$(grep -ho "<category>'[^<]*" "${dbs[@]}" | sed "s/<category>//; s/'//g" \
+          | sort | uniq -c | sort -rn || true)
+  {
+    echo "# Violations par table (nombre, table)"
+    local db
+    for db in "${dbs[@]}"; do
+      printf "%7d %s\n" "$(grep -c '<item>' "$db" || true)" "$(basename "$db" .lyrdb | sed 's/.*_sealed_//')"
+    done | sort -rn
+    echo
+    echo "# Violations par règle (nombre, règle), toutes tables confondues"
+    echo "${rules:-  (aucune)}"
+  } > "$summary"
 
-  local label="VAL-13"
-  [[ "$mode" == "minimal" ]] && label="VAL-13(min)"
-  if [[ "$total" -eq 0 ]]; then
-    log_check "$label" OK "DRC $mode : 0 violation (${#dbs[@]} table(s))"
+  # Obligatoires vs recommandées (convention IHP : nom de règle terminé par R)
+  local is_rec='\.[A-Za-z0-9]*R(_|$)'
+  local n_mand n_rec list_mand list_rec
+  n_mand=$(echo "$rules" | awk 'NF' | grep -vE "$is_rec" | awk '{s+=$1} END{print s+0}')
+  n_rec=$(echo "$rules"  | awk 'NF' | grep -E  "$is_rec" | awk '{s+=$1} END{print s+0}')
+  list_mand=$(echo "$rules" | awk 'NF' | grep -vE "$is_rec" | awk '{printf " %s=%s", $2, $1}')
+  list_rec=$(echo "$rules"  | awk 'NF' | grep -E  "$is_rec" | awk '{printf " %s=%s", $2, $1}')
+
+  if [[ "$n_mand" -eq 0 ]]; then
+    log_check "$label" OK "DRC $mode : 0 violation de règle obligatoire"
   else
     # Pas d'arrêt : chaque violation doit être corrigée ou justifiée (journal des écarts)
-    log_check "$label" ECART "DRC $mode : $total violation(s) :$detail"
+    log_check "$label" ECART "DRC $mode : $n_mand violation(s) de règles obligatoires :$list_mand"
   fi
+  if [[ "$n_rec" -gt 0 ]]; then
+    log_check "$label" MANUEL "DRC $mode : $n_rec violation(s) de règles recommandées (non bloquantes) :$list_rec"
+  fi
+  echo "[FLOW] détail : $summary"
 
   # VAL-15 / VAL-16 : en mode full, antenna et densité font partie du deck
   if [[ "$mode" == "full" ]]; then
-    log_check VAL-15 MANUEL "antenna incluse dans le DRC full : lire la table antenna dans klayout/drc-full"
-    log_check VAL-16 MANUEL "densité vérifiée sur le GDS SANS fill : violations de densité attendues tant que --fill n'est pas fait"
+    log_check VAL-15 MANUEL "antenna incluse dans le DRC full : voir la ligne 'antenna' de drc_full_summary.txt"
+    log_check VAL-16 MANUEL "densité vérifiée sur le GDS SANS fill : règles *Fil.* attendues tant que --fill n'est pas fait"
   fi
 }
 
@@ -497,9 +559,10 @@ case "$STEP" in
   gds)         step_gds ;;
   drc)         step_drc full ;;
   drc_minimal) step_drc minimal ;;
+  drc_report)  drc_report "${2:-full}" ;;   # analyse seule : drc_report [full|minimal]
   lvs)         step_lvs ;;
   all)         step_synth; step_backend; step_gds; step_drc full; step_lvs ;;
-  *)           echo "Usage : $0 {synth|floorplan|placement|cts|routing|finishing|backend|gds|drc|drc_minimal|lvs|all}"; exit 2 ;;
+  *)           echo "Usage : $0 {synth|floorplan|placement|cts|routing|finishing|backend|gds|drc|drc_minimal|drc_report [full|minimal]|lvs|all}"; exit 2 ;;
 esac
 
 echo "[FLOW] terminé : $LOGDIR"

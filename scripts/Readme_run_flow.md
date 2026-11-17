@@ -1,6 +1,6 @@
 # run_flow.sh : flot open-source Croc (IHP130 sg13cmos5l)
 
-`scripts/run_flow.sh` enchaîne les étapes du flot open-source de Croc (synthèse → P&R → GDS → DRC). Il vérifie automatiquement les tests du plan de validation et archive chaque run dans `logs/<RUN_ID>/`.
+`scripts/run_flow.sh` enchaîne les étapes du flot open-source de Croc (synthèse → P&R → GDS → DRC → LVS). Il vérifie automatiquement les tests du plan de validation et archive chaque run dans `logs/<RUN_ID>/`.
 
 Il ne remplace pas les scripts d'origine du kit (`yosys/run_synthesis.sh`, `openroad/run_backend.sh`, `klayout/run_finishing.sh`, `klayout/run_drc.sh`). Il les appelle, puis ajoute la traçabilité (versions, durées, sommes de contrôle) et les checks.
 
@@ -12,8 +12,8 @@ Il ne remplace pas les scripts d'origine du kit (`yosys/run_synthesis.sh`, `open
 |---|---|
 | Docker Engine natif (pas Docker Desktop) | `docker ps` répond sans erreur |
 | Sous-modules initialisés | `git submodule status` : aucune ligne ne commence par `-` |
-| Script exécutable | `chmod +x scripts/run_flow.sh` |
-| Session `tmux` (runs longs, SSH) | `tmux new -s croc` |
+| Scripts exécutables | `chmod +x scripts/run_flow.sh scripts/run_detached.sh` |
+| Runs longs (plus de quelques minutes) | `scripts/run_detached.sh` : le run survit à la déconnexion SSH (voir §2) |
 
 > **Le script se lance DANS le conteneur.** Sur l'hôte, les outils (`bender`, `yosys`, `openroad`, `klayout`, `gawk`) n'existent pas.
 
@@ -21,18 +21,34 @@ Il ne remplace pas les scripts d'origine du kit (`yosys/run_synthesis.sh`, `open
 
 ## 2. Démarrage rapide
 
+### Étape courte ou essai (terminal interactif)
+
 ```bash
 # Sur l'hôte
-cd ~/crack/CRACK---Croc-Asic-Kit
-tmux new -s croc                    # ou : tmux attach -t croc
+cd ~/Documents/emilien/CRACK_docker/CRACK---Croc-Asic-Kit
 ./scripts/start_linux_nogui.sh      # entre dans le conteneur
 
 # Dans le conteneur (/fosic/designs/croc)
 which bender yosys openroad klayout gawk
-./scripts/run_flow.sh all           # flot complet
+./scripts/run_flow.sh synth
 ```
 
-Pour se détacher sans arrêter le run : `Ctrl+B` puis `D`. Pour revenir : `tmux attach -t croc`.
+> Une session interactive **meurt avec la connexion SSH**. `tmux` n'est pas installé sur l'hôte du CIME, et un `tmux` lancé dans le conteneur ne protège pas : il disparaît avec le conteneur. Pour tout ce qui dure (backend ≈ 40 min, DRC full ≈ 43 min, `all` ≈ 1 h 30), utiliser le mode détaché ci-dessous.
+
+### Run long (détaché, survit à la déconnexion)
+
+```bash
+# Sur l'hôte (pas dans le conteneur)
+RUN_ID=baseline_open_ihp130 ./scripts/run_detached.sh all
+./scripts/run_detached.sh status     # état du run, dernières lignes, derniers ECHEC/ECART/MANUEL
+./scripts/run_detached.sh log        # suit la sortie (Ctrl+C quitte le suivi, pas le run)
+./scripts/run_detached.sh stop       # arrête le run (les résultats partiels restent)
+```
+
+- Mêmes étapes et mêmes variables que `run_flow.sh` : `./scripts/run_detached.sh drc_report full`, `DRC_JOBS=8`, `CROC_PDK`, `RUN_ID`.
+- **Un seul run à la fois** : les runs partagent `openroad/save`, `klayout/out`… et s'écraseraient (`FORCE=1` pour passer outre).
+- La sortie complète est dans `logs/<RUN_ID>.out` ; les résultats habituels restent dans `logs/<RUN_ID>/`.
+- Principe : `nohup docker compose run --rm -T --name croc_<RUN_ID> … --skip bash -c "./scripts/run_flow.sh <étape>"` lancé en arrière-plan sur l'hôte. Un essai avec `sleep 120` a fonctionné le 17/11/2026.
 
 ---
 
@@ -51,15 +67,18 @@ Pour se détacher sans arrêter le run : `Ctrl+B` puis `D`. Pour revenir : `tmux
 | `routing` | `run_backend.sh --routing` | `save/04_croc.routed.zip` | VAL-08 | 2131 s |
 | `finishing` | `run_backend.sh --finishing` | `out/croc.{def,v,odb,sdc}` | sorties | 55 s |
 | `backend` | les 5 étapes ci-dessus | | VAL-05 à VAL-08 | ≈ 40 min |
-| `gds` | `run_finishing.sh --gds --seal` | `klayout/out/croc.sealed.gds.gz` | GDS, VAL-17 (partiel) | à mesurer |
-| `drc_minimal` | `run_drc.sh --minimal` | `klayout/drc-minimal/` | VAL-13(min) | à mesurer |
-| `drc` | `run_drc.sh --full` (avec antenna) | `klayout/drc-full/` | VAL-13, VAL-15, VAL-16 | à mesurer |
+| `gds` | `run_finishing.sh --gds --seal` | `klayout/out/croc.sealed.gds.gz` | GDS, VAL-17 (partiel) | 58 s |
+| `drc_minimal` | `run_drc.sh --minimal` | `klayout/drc-minimal/` | VAL-13(min) | 242 s |
+| `drc` | `run_drc.sh --full` (avec antenna), puis `drc_report` | `klayout/drc-full/` | VAL-13, VAL-15, VAL-16 | 2605 s (≈ 43 min) |
+| `drc_report [full\|minimal]` | aucun : analyse les résultats DRC déjà présents | `logs/<RUN_ID>/drc_<mode>_summary.txt` | VAL-13 | à mesurer |
 | `lvs` | `verilog2spice.py` puis `run_lvs.py` du PDK (voir §9) | `klayout/lvs/` | VAL-14 | à mesurer |
 | `all` | synth + backend + gds + drc + lvs | | tous | |
 
-\* PC CIME distant, run du 23/10/2026. Le nombre de cœurs est noté dans `versions.txt`.
+\* `ocaepc69` (CIME, 20 cœurs, 31 Go de RAM), run `open_ihp130_20261023_0855` (étapes lancées entre le 23/10 et le 12/11/2026). La durée du DRC full est relevée dans `klayout/drc-full/drc-coordinator.log`. Le nombre de cœurs de chaque run est noté dans `versions.txt`.
 
 Les étapes du backend repartent du checkpoint de l'étape précédente (`openroad/save/*.zip`). On peut donc relancer une seule étape après une correction.
+
+**DRC full.** `run_drc.py` lance une trentaine de tables de règles en parallèle (`DRC_JOBS`). La table `sg13cmos5l_maximal` fixe la durée totale (≈ 43 min) ; les autres finissent en ≈ 18 min. `run_drc.py` **sort avec un code d'erreur dès qu'il y a des violations** (« KLayout DRC Check Failed ») : ce n'est pas un plantage. Le script intercepte ce code ; seuls l'absence de résultat (`.lyrdb`) ou l'exception d'un worker (`drc-coordinator.log`) arrêtent le flot. `drc_report` analyse ensuite les résultats : violations par table et par règle dans `drc_<mode>_summary.txt`, règles obligatoires (`ECART`) séparées des règles recommandées dont le nom se termine par `R`, par exemple `Pad.fR_M2` (`MANUEL`). On peut le relancer seul : `RUN_ID=<nom> ./scripts/run_flow.sh drc_report full`.
 
 ---
 
@@ -91,7 +110,8 @@ logs/<RUN_ID>/
 ├── <étape>.log      # log complet de chaque étape, sans codes couleur
 ├── croc_yosys.v     # copie de la netlist
 ├── openroad/        # copie de reports/, save/, out/, logs/
-└── klayout/         # logs KLayout + rapports DRC (*.lyrdb)
+├── klayout/         # logs KLayout + rapports DRC (*.lyrdb), logs et schéma du LVS
+└── drc_<mode>_summary.txt  # violations DRC par table et par règle (étape drc_report)
 ```
 
 Chaque lancement ajoute une ligne `===== date : étape '...' =====` dans `checks.txt` et `timing.txt`. Elle permet de distinguer plusieurs lancements dans un même dossier.
@@ -107,9 +127,9 @@ Chaque lancement ajoute une ligne `===== date : étape '...' =====` dans `checks
 | Statut | Signification | Action |
 |---|---|---|
 | `OK` | Critère vérifié automatiquement | aucune |
-| `ECART` | Résultat anormal mais non bloquant (latch, violation DRC…) | corriger, ou justifier dans le **journal des écarts** |
-| `ECHEC` | Critère non rempli. Arrête le flot sauf pour le routage, la finition et le DRC | corriger avant de continuer |
-| `MANUEL` | Non vérifiable automatiquement (skew, congestion, grille d'alim…) | lire le rapport indiqué |
+| `ECART` | Résultat anormal mais non bloquant (latch, violation d'une règle DRC obligatoire, mismatch LVS…) | corriger, ou justifier dans le **journal des écarts** |
+| `ECHEC` | Critère non rempli. Arrête le flot, sauf pour le routage et la finition | corriger avant de continuer |
+| `MANUEL` | Non vérifiable automatiquement (skew, congestion, grille d'alim…), ou règle DRC recommandée | lire le rapport indiqué |
 
 Relecture rapide :
 
@@ -133,7 +153,12 @@ cat logs/<RUN_ID>/timing.txt
 | Sous-module `artistic` : `Permission denied (publickey)` | Sous-module déclaré en SSH | Ajouter une clé GitHub, ou `git config --global url."https://github.com/".insteadOf git@github.com:` |
 | `VAL-01b : ECHEC` alors que le log dit `0 Error` | Codes couleur ANSI dans le log Bender | Corrigé dans le script (filtre ANSI) |
 | Résultats d'un ancien run mélangés | `openroad/{save,reports,out,logs}` non vidés | Archiver/supprimer ces dossiers avant une baseline propre |
-| Violations de densité au DRC full | `run_drc.sh` vérifie le GDS **sans fill** | Attendu ; le fill (`--fill`) n'est pas encore intégré |
+| Violations de densité au DRC full (`AFil.g`, `GFil.g`, `M1Fil.h`…) | `run_drc.sh` vérifie le GDS **sans fill** | Attendu ; le fill (`--fill`) n'est pas encore intégré |
+| Violations `Pad.fR_*`, `Pad.dR`, `Pad.d1R` au DRC full, absentes du DRC minimal | Règles **recommandées** (suffixe `R`), exclues du mode minimal (`--no_recommended`) | Classées `MANUEL` par `drc_report` ; à faire valider par l'enseignant |
+| Le DRC full s'arrête sans aucun check dans `checks.txt` | `run_drc.py` renvoie un code ≠ 0 dès qu'il y a des violations, et `set -e` arrête le script | Corrigé dans la version actuelle de `run_flow.sh` (code retour intercepté) ; relancer l'analyse avec `drc_report` |
+| Run perdu quand la session SSH se coupe | Session interactive (ou `tmux` dans le conteneur) liée à la connexion ; pas de `tmux` sur l'hôte | Lancer avec `scripts/run_detached.sh` (voir §2) |
+| `run_drc.py` : `No module named 'klayout'` | Lancé sur l'hôte | Le lancer dans le conteneur |
+| `VAL-17 : ECART` alors que le log ne signale rien | Le log `def2stream` contient la ligne `[INFO] Checking for missing cell...` | Ligne exclue du filtre dans la version actuelle |
 
 ---
 
@@ -143,6 +168,7 @@ cat logs/<RUN_ID>/timing.txt
 - **LVS (VAL-14)** : intégré (étape `lvs`, voir §9) mais **jamais exécuté sur le vrai design** : la conversion Verilog → SPICE et les règles de comparaison sont à valider au premier run.
 - **Fill et DRC sur GDS rempli (VAL-16)** : non intégrés.
 - `set_thread_count 8` est en dur dans les Tcl de placement et de routage : à prendre en compte pour comparer les durées entre machines.
+- `versions.txt` est **réécrit** à chaque lancement dans un même `RUN_ID` : les versions notées sont celles du dernier lancement. Les checkpoints sont comparés à ce fichier (`-nt`), donc relancer une étape recrée la référence de date.
 - **SDC** : 4 entrées sans `set_input_delay`, 4 sorties sans `set_output_delay` (warnings du floorplan). Ne pas modifier `constraints.sdc` avant de figer le protocole (tâche 4.1).
 
 ---
