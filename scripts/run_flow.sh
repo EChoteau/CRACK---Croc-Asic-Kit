@@ -405,16 +405,25 @@ drc_report() {
     exit 1
   fi
 
-  # Run complet ? Une table avec un .log mais sans .lyrdb n'a pas terminé
-  local lg incomplete=""
-  for lg in "$rundir"/*_sealed_*.log; do
-    [[ -f "$lg" ]] || continue
-    [[ -f "${lg%.log}.lyrdb" ]] || incomplete+=" $(basename "$lg" .log | sed 's/.*_sealed_//')"
-  done
-  if [[ -n "$incomplete" ]]; then
-    log_check "$label" ECART "DRC $mode : table(s) sans résultat (run interrompu ?) :$incomplete"
+  # Run complet ? run_drc.py fusionne les .lyrdb partiels en <layout>_<top>_full.lyrdb
+  # puis supprime les partiels : si ce fichier existe, la fusion a eu lieu (= toutes les
+  # tables ont produit un résultat). Sinon, une table avec un .log mais sans .lyrdb
+  # n'a pas terminé.
+  local merged="" lg incomplete=""
+  merged=$(find "$rundir" -name "*_full.lyrdb" -type f 2>/dev/null | head -1)
+  if [[ -n "$merged" ]]; then
+    local ntab; ntab=$(find "$rundir" -name "*_sealed_*.log" -type f 2>/dev/null | wc -l)
+    log_check "$label" OK "DRC $mode : résultats fusionnés ($(basename "$merged")), $ntab table(s) lancée(s)"
   else
-    log_check "$label" OK "DRC $mode : ${#dbs[@]} table(s), toutes terminées"
+    for lg in "$rundir"/*_sealed_*.log; do
+      [[ -f "$lg" ]] || continue
+      [[ -f "${lg%.log}.lyrdb" ]] || incomplete+=" $(basename "$lg" .log | sed 's/.*_sealed_//')"
+    done
+    if [[ -n "$incomplete" ]]; then
+      log_check "$label" ECART "DRC $mode : table(s) sans résultat (run interrompu ?) :$incomplete"
+    else
+      log_check "$label" OK "DRC $mode : ${#dbs[@]} table(s), toutes terminées"
+    fi
   fi
 
   # Résumé : par table, puis par règle
@@ -423,12 +432,17 @@ drc_report() {
   rules=$(grep -ho "<category>'[^<]*" "${dbs[@]}" | sed "s/<category>//; s/'//g" \
           | sort | uniq -c | sort -rn || true)
   {
-    echo "# Violations par table (nombre, table)"
     local db
-    for db in "${dbs[@]}"; do
-      printf "%7d %s\n" "$(grep -c '<item>' "$db" || true)" "$(basename "$db" .lyrdb | sed 's/.*_sealed_//')"
-    done | sort -rn
-    echo
+    if [[ -z "$merged" ]]; then
+      echo "# Violations par table (nombre, table)"
+      for db in "${dbs[@]}"; do
+        printf "%7d %s\n" "$(grep -c '<item>' "$db" || true)" "$(basename "$db" .lyrdb | sed 's/.*_sealed_//')"
+      done | sort -rn
+      echo
+    else
+      echo "# (résultats fusionnés par run_drc.py : pas de ventilation par table, voir par règle)"
+      echo
+    fi
     echo "# Violations par règle (nombre, règle), toutes tables confondues"
     echo "${rules:-  (aucune)}"
   } > "$summary"
